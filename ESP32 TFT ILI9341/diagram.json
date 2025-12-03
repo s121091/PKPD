@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "author": "Hollanda Arief Kusuma",
+  "editor": "wokwi",
+  "parts": [
+    { "type": "board-esp32-devkit-c-v4", "id": "esp", "top": -19.2, "left": -81.56, "attrs": {} },
+    {
+      "type": "wokwi-ili9341",
+      "id": "lcd1",
+      "top": -61.8,
+      "left": 184.1,
+      "rotate": 90,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    [ "esp:TX", "$serialMonitor:RX", "", [] ],
+    [ "esp:RX", "$serialMonitor:TX", "", [] ],
+    [ "esp:5V", "lcd1:VCC", "red", [ "h-28.65", "v-201.6", "h211.2", "v67.2", "h19.2" ] ],
+    [ "lcd1:GND", "esp:GND.2", "black", [ "h-38.4", "v-48" ] ],
+    [ "lcd1:CS", "esp:5", "green", [ "h-86.4", "v28.8" ] ],
+    [ "lcd1:D/C", "esp:17", "yellow", [ "h-96", "v19.2" ] ],
+    [ "lcd1:MOSI", "esp:23", "cyan", [ "h-48", "v-76.81" ] ],
+    [ "lcd1:SCK", "esp:18", "blue", [ "h-67.2", "v-9.61" ] ],
+    [ "lcd1:MISO", "esp:19", "green", [ "h-38.4", "v-0.01", "h-19.2", "v-48" ] ],
+    [ "lcd1:RST", "esp:16", "magenta", [ "h-28.8", "v38.4" ] ]
+  ],
+  "dependencies": {}
+}
