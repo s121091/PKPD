@@ -1,11 +1,14 @@
 /*
- * Memory Bloom - V5.0 (Garden Therapy Edition)
+ * Memory Bloom - V15.5 (Partition Config & Slim)
  * ------------------------------------------------
- * 專為長者設計的記憶訓練遊戲 - 花園主題版
- * * 硬件要求：
- * 1. ⚠️ 必須拔掉屏幕的 SDO (MISO) 線 (Pin 9) 以免干擾觸摸屏
- * 2. 屏幕驅動: ILI9488 (SPI)
- * 3. 觸摸驅動: XPT2046
+ * 🛑 必讀：解決 "Sketch too big" 編譯錯誤
+ * 您的程序太大 (約 1.5MB)，默認分區 (1.2MB) 放不下。
+ * 請在 Arduino IDE 修改分區方案：
+ * ➡️ Tools (工具) -> Partition Scheme (分區方案) -> "Huge APP (3MB No OTA)"
+ * ------------------------------------------------
+ * 更新內容：
+ * 1. 移除未使用的 Firebase 輔助庫 (節省編譯時間和空間)
+ * 2. 保持所有核心功能 (WiFi, Firebase, GUI, 存儲)
  */
 
 #include <Arduino_GFX_Library.h> 
@@ -13,357 +16,714 @@
 #include <XPT2046_Touchscreen.h> 
 #include <vector>
 #include <SPI.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <time.h> 
 
-// FreeRTOS
+// 移除了不使用的 TokenHelper 和 RTDBHelper 以節省空間
+// #include <addons/TokenHelper.h> 
+// #include <addons/RTDBHelper.h>
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
 // ==========================================
-// 1. 硬件定義與驅動配置
+// 1. 配置與憑證 (⚠️ 請修改這裡)
 // ==========================================
+const char* WIFI_SSID = "Ivan";         
+const char* WIFI_PASSWORD = "awc121091"; 
 
-// --- 屏幕設置 ---
-// MISO 設為 -1 (不使用)，因為我們只需要寫入屏幕
-Arduino_DataBus *bus = new Arduino_ESP32SPI(17 /* DC */, 5 /* CS */, 18 /* SCK */, 23 /* MOSI */, -1 /* MISO */);
-// 初始化 ILI9488 (IPS 屏幕通常效果較好)
-Arduino_GFX *tft = new Arduino_ILI9488_18bit(bus, 16 /* RST */, 1, false);
-
-// --- 觸摸屏設置 ---
-#define TOUCH_CS_PIN  4  
-#define TOUCH_IRQ_PIN 26 
-XPT2046_Touchscreen ts(TOUCH_CS_PIN, TOUCH_IRQ_PIN);
-
-// --- 蜂鳴器 ---
-#define PIN_BUZZER 25
-// 音階頻率 (C4 到 D5)，讓聲音聽起來像音樂而不是噪音
-const int TONES[] = {262, 294, 330, 349, 392, 440, 494, 523, 587}; 
-
-// --- 矩陣鍵盤 ---
-const byte ROWS = 3; 
-const byte COLS = 3; 
-char keys[ROWS][COLS] = { {'1','2','3'}, {'4','5','6'}, {'7','8','9'} };
-byte rowPins[ROWS] = {32, 33, 27}; 
-byte colPins[COLS] = {14, 12, 13}; 
-
-Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+// 這裡必須填寫您的 Firebase 真實信息
+// Host 例子: "memory-bloom-12345-default-rtdb.firebaseio.com" (不要帶 https://)
+#define FIREBASE_HOST "your-project-id.firebaseio.com" 
+#define FIREBASE_AUTH "your_database_secret_key"
 
 // ==========================================
-// 2. 配色表 (老年人友善配色)
+// 2. 結構體定義
 // ==========================================
-// 使用 RGB565 格式
-#define C_BG          0xFFF4 // 米黃色背景 (Cream) - 護眼
-#define C_STEM        0x2589 // 莖葉綠 (Forest Green)
-#define C_FLOWER_OFF  0xE71C // 淺粉色/含苞 (Light Pink) - 待機狀態
-#define C_FLOWER_ON   0xFBC0 // 盛開亮橘色 (Vibrant Orange) - 激活狀態
-#define C_TEXT_DARK   0x2104 // 深灰色文字 (High Contrast) - 易讀
-#define C_TEXT_LIGHT  0xFFFF // 白色文字
-#define C_PANEL       0xDEFB // 狀態欄淺灰
-#define C_SHADOW      0x9492 // 陰影色 (用於增加立體感)
-#define C_WHITE       0xFFFF
+struct SystemConfig {
+    int difficulty;  // 0: Easy, 1: Hard, 2: Auto
+    bool soundOn;    // true: On
+    int gameMode;    // 0: Memory, 1: Counting
+};
+SystemConfig sysConfig = {2, true, 0}; 
+
+struct GameSession {
+    int modeType; 
+    int score;
+    unsigned long durationSeconds;
+    time_t timestamp;      
+    String sessionID;      
+};
 
 // ==========================================
 // 3. 全局變量
 // ==========================================
-SemaphoreHandle_t xGuiMutex; // 互斥鎖，防止繪圖衝突
-enum GameState { STATE_IDLE, STATE_SHOWING, STATE_INPUT, STATE_GAMEOVER, STATE_TEST };
-GameState currentState = STATE_IDLE;
+Preferences preferences;
+std::vector<GameSession> gameHistory;    
+std::vector<GameSession> pendingUploads; 
+unsigned long gameStartTime = 0; 
+SemaphoreHandle_t xGuiMutex; 
 
-std::vector<int> sequence; // 存儲題目序列
-int inputIndex = 0;        // 當前輸入進度
-int currentScore = 0;      // 當前分數
+// Firebase 變量
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool firebaseReady = false;
+unsigned long lastUploadTime = 0;
+const unsigned long UPLOAD_INTERVAL = 5000; 
 
-// 用於長按 "9" 進入測試模式
-unsigned long key9_press_time = 0;
-bool is_key9_pressing = false;
+// 狀態機
+enum GameState { 
+    STATE_WIFI_CONNECTING, 
+    STATE_MENU_MAIN, 
+    STATE_MENU_GAME_SELECT, 
+    STATE_MENU_DIFFICULTY, 
+    STATE_MENU_SETTINGS,
+    STATE_MENU_DATA,
+    STATE_GUIDE_READY, STATE_GUIDE_OBSERVE, STATE_GUIDE_RECALL,
+    STATE_MEM_SHOWING, STATE_MEM_INPUT, 
+    STATE_CNT_PREPARE, STATE_CNT_WAITING, STATE_CNT_INPUT, 
+    STATE_GAME_OVER
+};
+GameState currentState = STATE_WIFI_CONNECTING; 
 
-// 佈局參數
-int startX = 160;   // 花園區域起始 X (屏幕右側)
-int startY = 30;    // 花園區域起始 Y
-int btnWidth = 90;  // 花朵佔用寬度
-int btnHeight = 80; // 花朵佔用高度
-int gap = 15;       // 間距
+std::vector<int> sequence; 
+int inputIndex = 0;        
+int targetCount = 0;       
+int userTapCount = 0;      
+unsigned long lastTapTime = 0; 
+unsigned long showStartTime = 0; 
+int currentScore = 0;
+int currentSpeed = 1000; 
+
+int startX = 160;   
+int startY = 30;    
+int btnWidth = 90;  
+int btnHeight = 80; 
+int gap = 15;       
 
 // ==========================================
-// 4. UI 繪圖函數 (核心修改部分)
+// 4. 硬件驅動
 // ==========================================
+Arduino_DataBus *bus = new Arduino_ESP32SPI(17, 5, 18, 23, -1);
+Arduino_GFX *tft = new Arduino_ILI9488_18bit(bus, 16, 1, false);
 
-// 輔助：畫圓角矩形框（帶陰影，增加物體辨識度）
-void drawPanel(int x, int y, int w, int h, uint16_t color) {
-    tft->fillRoundRect(x + 4, y + 4, w, h, 10, C_SHADOW); // 陰影
-    tft->fillRoundRect(x, y, w, h, 10, color);            // 本體
+#define TOUCH_CS_PIN  4  
+#define TOUCH_IRQ_PIN 26 
+XPT2046_Touchscreen ts(TOUCH_CS_PIN, TOUCH_IRQ_PIN);
+
+#define PIN_BUZZER 25
+const int TONES[] = {262, 294, 330, 349, 392, 440, 494, 523, 587}; 
+
+const byte ROWS = 3; 
+const byte COLS = 3; 
+char keys[ROWS][COLS] = { {'1','2','3'}, {'4','5','6'}, {'7','8','9'} }; 
+byte rowPins[ROWS] = {32, 33, 27}; 
+byte colPins[COLS] = {14, 12, 13}; 
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ==========================================
+// 5. 配色表
+// ==========================================
+#define BLACK         0x0000
+#define WHITE         0xFFFF 
+#define COLOR_BG_LIGHT    0xFFDF 
+#define COLOR_BG_SHADOW   0x9CF3 
+#define COLOR_PRIMARY     0x43B2 
+#define COLOR_SECONDARY   0xF9A8 
+#define COLOR_ACCENT      0xFD60 
+#define COLOR_SUCCESS     0x07E0 
+#define COLOR_ERROR       0xF800 
+#define COLOR_BTN_NORMAL  0xDEFB  
+#define COLOR_BTN_ACTIVE  0xFD60  
+#define COLOR_TEXT_LIGHT  0x8410  
+
+// ==========================================
+// 6. 前向聲明
+// ==========================================
+void initWiFi();
+void initFirebase();
+void uploadPendingRecords();
+void uploadRecord(GameSession record);
+void updateStatistics(int score);
+void saveHistory();
+void loadHistory();
+void clearHistory();
+void drawDataHistoryScreen();
+void redrawMainMenu();
+void update_status(String text, uint16_t color);
+void drawGameElement(int id, bool active);
+void playTone(int freq, int duration);
+
+// ==========================================
+// 7. 輔助函數與數據存儲
+// ==========================================
+void playTone(int freq, int duration) {
+    if (sysConfig.soundOn) tone(PIN_BUZZER, freq, duration);
 }
 
-// 畫一朵花 (代替原本的方塊按鈕)
-// id: 0-8, active: true(亮/盛開), false(暗/含苞)
-void drawFlower(int id, bool active) {
+void saveHistory() {
+    if (gameHistory.size() > 10) {
+        std::vector<GameSession> recentHistory;
+        for (int i = gameHistory.size() - 10; i < gameHistory.size(); i++) {
+            recentHistory.push_back(gameHistory[i]);
+        }
+        gameHistory = recentHistory;
+    }
+    preferences.begin("mb_data", false);
+    int count = gameHistory.size();
+    preferences.putInt("count", count);
+    for (int i = 0; i < count; i++) {
+        String prefix = "g" + String(i);
+        uint8_t buffer[12];
+        memcpy(buffer, &gameHistory[i].modeType, sizeof(int));
+        memcpy(buffer + 4, &gameHistory[i].score, sizeof(int));
+        memcpy(buffer + 8, &gameHistory[i].durationSeconds, sizeof(unsigned long));
+        preferences.putBytes(prefix.c_str(), buffer, 12); 
+    }
+    preferences.end();
+}
+
+void loadHistory() {
+    preferences.begin("mb_data", true);
+    int count = preferences.getInt("count", 0);
+    gameHistory.clear();
+    for (int i = 0; i < count; i++) {
+        String prefix = "g" + String(i);
+        uint8_t buffer[12];
+        if (preferences.getBytes(prefix.c_str(), buffer, 12) > 0) {
+            GameSession s;
+            memcpy(&s.modeType, buffer, sizeof(int));
+            memcpy(&s.score, buffer + 4, sizeof(int));
+            memcpy(&s.durationSeconds, buffer + 8, sizeof(unsigned long));
+            s.sessionID = "-"; 
+            gameHistory.push_back(s);
+        }
+    }
+    preferences.end();
+}
+
+void clearHistory() {
+    preferences.begin("mb_data", false);
+    preferences.clear();
+    preferences.end();
+    gameHistory.clear();
+    playTone(500, 200);
+}
+
+void saveScoreToFirebase(int score, unsigned long duration) {
+    GameSession record;
+    record.modeType = sysConfig.gameMode;
+    record.score = score;
+    record.durationSeconds = duration;
+    record.timestamp = time(nullptr); 
+    record.sessionID = String(millis());
+    
+    gameHistory.push_back(record);
+    saveHistory();
+    
+    if (firebaseReady && WiFi.status() == WL_CONNECTED) {
+        uploadRecord(record);
+    } else {
+        pendingUploads.push_back(record);
+    }
+    updateStatistics(score);
+}
+
+// ==========================================
+// 8. 網絡功能
+// ==========================================
+void initWiFi() {
     if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
-        int row = id / 3;
-        int col = id % 3;
-        // 計算中心點
+        tft->fillScreen(COLOR_BG_LIGHT);
+        tft->setTextColor(COLOR_PRIMARY); tft->setTextSize(3);
+        tft->setCursor(20, 100); tft->println("Connecting");
+        tft->setCursor(20, 140); tft->println("to WiFi...");
+        xSemaphoreGive(xGuiMutex);
+    }
+
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 10) { 
+        delay(500);
+        attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+        initFirebase();
+    }
+}
+
+void initFirebase() {
+    config.database_url = FIREBASE_HOST;
+    config.signer.tokens.legacy_token = FIREBASE_AUTH;
+    
+    Firebase.reconnectNetwork(true);
+    fbdo.setBSSLBufferSize(4096, 1024);
+    fbdo.setResponseSize(2048);
+    
+    Firebase.begin(&config, &auth);
+    Firebase.setDoubleDigits(5);
+    
+    long start = millis();
+    while (!Firebase.ready() && millis() - start < 5000) {
+        delay(100);
+    }
+    
+    if (Firebase.ready()) {
+        firebaseReady = true;
+        String devicePath = "/devices/" + WiFi.macAddress();
+        // 語法修正: .RTDB
+        Firebase.RTDB.setString(&fbdo, devicePath + "/lastSeen", String(millis()/1000));
+        uploadPendingRecords();
+    }
+}
+
+void uploadRecord(GameSession record) {
+    if (!firebaseReady) return;
+    String deviceID = WiFi.macAddress();
+    String recordPath = "/devices/" + deviceID + "/sessions/" + record.sessionID;
+    
+    FirebaseJson json;
+    json.set("mode", record.modeType == 0 ? "memory" : "counting");
+    json.set("score", record.score);
+    json.set("duration", record.durationSeconds);
+    json.set("timestamp", (double)record.timestamp);
+    
+    // 語法修正: .RTDB
+    if (!Firebase.RTDB.setJSON(&fbdo, recordPath.c_str(), &json)) {
+        pendingUploads.push_back(record);
+    }
+}
+
+void uploadPendingRecords() {
+    if (pendingUploads.empty() || !firebaseReady) return;
+    std::vector<GameSession> retryQueue = pendingUploads;
+    pendingUploads.clear();
+    for (auto& rec : retryQueue) {
+        uploadRecord(rec);
+        delay(50);
+    }
+}
+
+void updateStatistics(int score) {
+    if (!firebaseReady) return;
+    String deviceID = WiFi.macAddress();
+    String statsPath = "/statistics/" + deviceID;
+    
+    int totalGames = 0, totalScore = 0, highScore = 0;
+    
+    // 語法修正: .RTDB
+    if (Firebase.RTDB.getInt(&fbdo, statsPath + "/totalGames")) totalGames = fbdo.to<int>();
+    if (Firebase.RTDB.getInt(&fbdo, statsPath + "/totalScore")) totalScore = fbdo.to<int>();
+    if (Firebase.RTDB.getInt(&fbdo, statsPath + "/highScore")) highScore = fbdo.to<int>();
+    
+    totalGames++;
+    totalScore += score;
+    if (score > highScore) highScore = score;
+    
+    FirebaseJson statsJson;
+    statsJson.set("totalGames", totalGames);
+    statsJson.set("totalScore", totalScore);
+    statsJson.set("highScore", highScore);
+    
+    // 語法修正: .RTDB
+    Firebase.RTDB.setJSON(&fbdo, statsPath.c_str(), &statsJson);
+}
+
+// ==========================================
+// 9. UI 繪製
+// ==========================================
+void drawRoundedButton(int x, int y, int w, int h, uint16_t color, bool pressed = false) {
+    if (pressed) {
+        tft->fillRoundRect(x + 2, y + 2, w, h, 12, color);
+    } else {
+        tft->fillRoundRect(x + 4, y + 4, w, h, 12, COLOR_BG_SHADOW);
+        tft->fillRoundRect(x, y, w, h, 12, color);
+    }
+}
+
+void drawMenuBtn(int slot, String text, uint16_t color, bool selected) {
+    int y = 90 + (slot * 70);
+    int x = 60; int w = 360; int h = 55;
+    if (selected) color = COLOR_ACCENT;
+    drawRoundedButton(x, y, w, h, color, false);
+    tft->setTextColor(WHITE); tft->setTextSize(3);
+    int txtX = x + (w - (text.length() * 18)) / 2;
+    tft->setCursor(txtX, y + 16);
+    tft->print(text);
+}
+
+void drawTextMenuItem(int slot, String label, String value, bool selected) {
+    int y = 80 + (slot * 65);
+    uint16_t color = selected ? COLOR_ACCENT : COLOR_BTN_NORMAL;
+    uint16_t txtColor = selected ? WHITE : BLACK;
+    drawRoundedButton(40, y, 400, 55, color, false);
+    tft->setTextColor(txtColor); tft->setTextSize(3);
+    tft->setCursor(60, y + 16); tft->print(label);
+    if (value != "") { tft->setCursor(280, y + 16); tft->print(value); }
+}
+
+void drawGameElement(int id, bool active) {
+    if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+        int row = id / 3; int col = id % 3;
         int cx = startX + col * (btnWidth + gap) + (btnWidth / 2);
         int cy = startY + row * (btnHeight + gap) + (btnHeight / 2);
-        
-        uint16_t petalColor = active ? C_FLOWER_ON : C_FLOWER_OFF;
+        tft->fillRect(cx - 45, cy - 40, 90, 80, COLOR_BG_LIGHT);
 
-        // 1. 清除該區域背景
-        tft->fillRect(cx - btnWidth/2, cy - btnHeight/2, btnWidth, btnHeight, C_BG);
-
-        // 2. 畫莖葉 (裝飾)
-        tft->drawLine(cx, cy + 10, cx, cy + 35, C_STEM);
-        // 畫葉子 (用兩個小圓模擬)
-        tft->fillCircle(cx - 12, cy + 25, 6, C_STEM);
-        tft->fillCircle(cx + 12, cy + 25, 6, C_STEM);
-
-        // 3. 畫花瓣 (由4個圓組成，模擬繡球花或幸運草形狀)
-        int r = 14; 
-        tft->fillCircle(cx - 9, cy - 9, r, petalColor);
-        tft->fillCircle(cx + 9, cy - 9, r, petalColor);
-        tft->fillCircle(cx - 9, cy + 9, r, petalColor);
-        tft->fillCircle(cx + 9, cy + 9, r, petalColor);
-
-        // 4. 畫花蕊 (顯示數字，方便對應鍵盤)
-        tft->fillCircle(cx, cy, 13, C_TEXT_LIGHT); // 白底
-        tft->drawCircle(cx, cy, 13, C_SHADOW);     // 邊框
-
-        tft->setCursor(cx - 6, cy - 8); 
-        tft->setTextColor(C_TEXT_DARK); 
-        tft->setTextSize(3);      
-        tft->print(id + 1);
-
+        if (sysConfig.gameMode == 0) { 
+            uint16_t color = active ? COLOR_BTN_ACTIVE : COLOR_BTN_NORMAL;
+            tft->fillRoundRect(cx - 40, cy - 35, 80, 70, 12, color);
+            if (!active) tft->drawRoundRect(cx - 40, cy - 35, 80, 70, 12, COLOR_BG_SHADOW);
+            tft->setTextColor(active ? WHITE : BLACK); tft->setTextSize(3);
+            tft->setCursor(cx - 8, cy - 10); tft->print(id + 1);
+        } else { 
+            if (active) {
+                tft->fillCircle(cx, cy, 25, COLOR_SECONDARY);
+                tft->fillCircle(cx, cy, 15, WHITE);
+            } else {
+                tft->drawCircle(cx, cy, 25, COLOR_PRIMARY);
+                tft->drawCircle(cx, cy, 24, COLOR_PRIMARY);
+            }
+        }
         xSemaphoreGive(xGuiMutex);
     }
 }
 
-// 更新左側狀態欄信息
-// line1: 大標題, line2: 次要信息, color: 標題顏色
-void update_status(String line1, String line2, uint16_t color) {
+void update_status(String text, uint16_t color = COLOR_PRIMARY) {
     if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
-        // 清除左側區域 (保留右側花園)
-        tft->fillRect(0, 80, startX - 5, 240, C_BG); 
-        
-        // 畫一個信息板
-        drawPanel(10, 90, 135, 140, C_PANEL);
+        tft->fillRect(0, 0, 480, 30, COLOR_BG_LIGHT); 
+        tft->drawFastVLine(startX - 10, 20, 280, COLOR_BG_SHADOW);
+        tft->setTextColor(color); tft->setTextSize(3); tft->setCursor(20, 100); 
+        int y = 100;
+        for (int i = 0; i < text.length(); i += 8) {
+            tft->setCursor(20, y);
+            tft->println(text.substring(i, min((int)text.length(), i + 8)));
+            y += 40;
+        }
+        if (currentState != STATE_MENU_MAIN && currentState != STATE_GAME_OVER && currentState != STATE_WIFI_CONNECTING) {
+            tft->setTextSize(2); tft->setTextColor(BLACK); tft->setCursor(350, 10);
+            tft->print("Score: "); tft->setTextColor(COLOR_ACCENT); tft->print(currentScore);
+        }
+        xSemaphoreGive(xGuiMutex);
+    }
+}
 
-        // 第一行 (狀態/標題)
-        tft->setTextColor(color);
-        tft->setTextSize(3); 
-        // 簡單的自動換行處理 (如果文字太長手動換行)
-        tft->setCursor(20, 110);
-        tft->println(line1);
+void screen_msg(String l1, String l2, uint16_t color = COLOR_PRIMARY) {
+    if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+        tft->fillScreen(COLOR_BG_LIGHT);
+        tft->drawRoundRect(20, 20, 440, 280, 20, COLOR_BG_SHADOW);
+        tft->setTextColor(color); tft->setTextSize(4);
+        tft->setCursor(60, 100); tft->println(l1);
+        tft->setTextColor(BLACK); tft->setTextSize(3);
+        tft->setCursor(60, 160); tft->println(l2);
+        xSemaphoreGive(xGuiMutex);
+    }
+}
+
+void drawDataHistoryScreen() {
+    if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+        tft->fillScreen(COLOR_BG_LIGHT);
+        tft->setTextColor(COLOR_PRIMARY); tft->setTextSize(3);
+        tft->setCursor(20, 20); tft->print("GAME HISTORY");
         
-        // 第二行 (說明/分數)
-        tft->setTextColor(C_TEXT_DARK); 
+        tft->setTextColor(BLACK); tft->setTextSize(2);
+        tft->setCursor(30, 60); tft->print("Mode");
+        tft->setCursor(180, 60); tft->print("Score");
+        tft->setCursor(320, 60); tft->print("Time");
+        tft->drawFastHLine(20, 80, 440, COLOR_BG_SHADOW);
+        
+        int y = 95;
+        if (gameHistory.empty()) {
+            tft->setCursor(150, 150); tft->print("No Records");
+        } else {
+            int count = 0;
+            for (int i = gameHistory.size() - 1; i >= 0; i--) {
+                if (count >= 6) break;
+                
+                GameSession s = gameHistory[i];
+                tft->setTextColor(COLOR_TEXT_LIGHT);
+                
+                tft->setCursor(30, y); tft->print(s.modeType == 0 ? "Mem" : "Cnt");
+                tft->setCursor(190, y); tft->print(s.score);
+                tft->setCursor(320, y); tft->print(s.durationSeconds); tft->print("s");
+                y += 35;
+                count++;
+            }
+        }
+        tft->setTextColor(COLOR_ERROR);
+        tft->setCursor(20, 300); tft->print("9. Back"); 
+        xSemaphoreGive(xGuiMutex);
+    }
+}
+
+void redrawMainMenu() {
+    if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+        tft->fillScreen(COLOR_BG_LIGHT);
+        
         tft->setTextSize(2);
-        tft->setCursor(20, 160);
-        tft->println(line2);
+        if (firebaseReady) {
+            tft->setTextColor(COLOR_SUCCESS); tft->setCursor(20, 20); tft->print("Cloud Online");
+        } else if (WiFi.status() == WL_CONNECTED) {
+            tft->setTextColor(COLOR_ACCENT); tft->setCursor(20, 20); tft->print("WiFi Only");
+        } else {
+            tft->setTextColor(COLOR_ERROR); tft->setCursor(20, 20); tft->print("Offline");
+        }
 
+        tft->setTextColor(COLOR_PRIMARY); tft->setTextSize(4);
+        tft->setCursor(80, 60); tft->print("Memory Bloom");
+        xSemaphoreGive(xGuiMutex);
+    }
+    drawMenuBtn(0, "1. Start Game", COLOR_SECONDARY, false);
+    drawMenuBtn(1, "2. Settings", COLOR_PRIMARY, false);
+    drawMenuBtn(2, "3. Data View", COLOR_ACCENT, false);
+    
+    // 手動同步按鈕
+    drawMenuBtn(3, "4. Sync Data", firebaseReady ? COLOR_SUCCESS : COLOR_ERROR, false);
+    
+    if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+        tft->setTextColor(BLACK); tft->setTextSize(2);
+        tft->setCursor(100, 300); tft->print("Hold '9' to Exit");
         xSemaphoreGive(xGuiMutex);
     }
 }
 
-// 初始化整個界面
-void build_ui() {
+void drawDifficultyMenu() {
     if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
-        tft->fillScreen(C_BG); // 刷上米色背景
-
-        // 左上角標題區
-        tft->setCursor(15, 30); 
-        tft->setTextColor(C_STEM); // 綠色標題
-        tft->setTextSize(3);
-        tft->println("Memory");
-        tft->setCursor(15, 60);
-        tft->println("Bloom");
-        
-        // 畫一條分隔線
-        tft->drawFastVLine(startX - 15, 20, 280, C_SHADOW);
+        tft->fillScreen(COLOR_BG_LIGHT);
+        tft->setTextColor(COLOR_PRIMARY); tft->setTextSize(3);
+        tft->setCursor(120, 30); tft->print("DIFFICULTY");
         xSemaphoreGive(xGuiMutex);
     }
-    
-    // 畫出初始的 9 朵花 (未激活狀態)
-    for(int i=0; i<9; i++) drawFlower(i, false);
-    
-    // 初始提示
-    update_status("Welcome", "Press '5'\nTo Start", C_TEXT_DARK);
+    drawTextMenuItem(0, "1. Easy", "", false);
+    drawTextMenuItem(1, "2. Hard", "", false);
+    drawTextMenuItem(2, "3. Auto", "(Best)", false);
+    if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+        tft->setTextColor(COLOR_ERROR); tft->setTextSize(2);
+        tft->setCursor(20, 300); tft->print("9. Back");
+        xSemaphoreGive(xGuiMutex);
+    }
 }
 
-// 進入硬件測試模式 (維護用)
-void enter_test_mode() {
+void redrawSettingsMenu() {
     if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
-        tft->fillScreen(C_WHITE); 
-        tft->setTextColor(C_TEXT_DARK);
-        tft->setTextSize(2);
-        tft->setCursor(10, 10);
-        tft->print("TEST MODE: Draw to test touch");
-        tft->setCursor(10, 40);
-        tft->print("Press Keypad to Exit");
+        tft->fillScreen(COLOR_BG_LIGHT);
+        tft->setTextColor(COLOR_PRIMARY); tft->setTextSize(3);
+        tft->setCursor(150, 30); tft->print("SETTINGS");
         xSemaphoreGive(xGuiMutex);
     }
-    currentState = STATE_TEST;
-    is_key9_pressing = false; 
+    drawMenuBtn(0, "1. Sound: " + String(sysConfig.soundOn ? "ON" : "OFF"), COLOR_BTN_NORMAL, false);
+    drawMenuBtn(1, "2. Clear Data", COLOR_ERROR, false);
+    if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+        tft->setTextColor(COLOR_ERROR); tft->setTextSize(2);
+        tft->setCursor(20, 300); tft->print("9. Back");
+        xSemaphoreGive(xGuiMutex);
+    }
 }
 
 // ==========================================
-// 5. 遊戲主邏輯任務
+// 10. 系統任務
 // ==========================================
-void task_game(void *pv) {
+void task_system(void *pv) {
+    initWiFi();
+    currentState = STATE_MENU_MAIN; 
+    redrawMainMenu();
+
     while(1) {
-        char key = keypad.getKey(); 
-        
-        // --- 特殊功能：長按 9 進入測試模式 ---
-        if (key == '9') {
-            if (keypad.getState() == PRESSED) {
-                is_key9_pressing = true;
-                key9_press_time = millis();
-            } else if (keypad.getState() == RELEASED) {
-                is_key9_pressing = false;
-            }
+        char key = keypad.getKey();
+        bool keyPressed = (key != NO_KEY && keypad.getState() == PRESSED);
+
+        // 後台任務
+        if (firebaseReady && !pendingUploads.empty() && millis() - lastUploadTime > UPLOAD_INTERVAL) {
+            uploadPendingRecords();
+            lastUploadTime = millis();
         }
-        if (currentState == STATE_IDLE && is_key9_pressing) {
-            if (millis() - key9_press_time > 5000) {
-                tone(PIN_BUZZER, 3000, 500); 
-                enter_test_mode();
-                is_key9_pressing = false; // 重置防止重複觸發
+
+        // 全局操作: 長按 9 退出
+        if (key == '9' && keypad.getState() == HOLD) {
+             if (currentState != STATE_MENU_MAIN) {
+                 playTone(1000, 500); 
+                 currentState = STATE_MENU_MAIN;
+                 redrawMainMenu();
+                 vTaskDelay(500); 
+                 continue; 
+             }
+        }
+        // 全局操作: 單按 9 返回
+        if (keyPressed && key == '9') {
+            if (currentState == STATE_MENU_GAME_SELECT || currentState == STATE_MENU_SETTINGS || currentState == STATE_MENU_DATA) {
+                currentState = STATE_MENU_MAIN; redrawMainMenu(); continue;
+            } else if (currentState == STATE_MENU_DIFFICULTY) {
+                currentState = STATE_MENU_GAME_SELECT; screen_msg("Select Game", "1.Memory 2.Count"); continue;
             }
         }
 
-        // --- 測試模式繪圖邏輯 ---
-        if (currentState == STATE_TEST && ts.touched()) {
-            TS_Point p = ts.getPoint();
-            if (xSemaphoreTake(xGuiMutex, 10) == pdTRUE) {
-                // XPT2046 坐標映射 (根據實際情況可能需要微調)
-                int x_map = map(p.x, 200, 3800, 0, 480); 
-                int y_map = map(p.y, 200, 3800, 320, 0); 
-                tft->fillCircle(x_map, y_map, 2, C_STEM); 
-                xSemaphoreGive(xGuiMutex);
-            }
-        }
-
-        // --- 狀態機邏輯 ---
         switch (currentState) {
-            case STATE_IDLE:
-                // 等待按 '5' 開始
-                if (key == '5' && keypad.getState() == PRESSED) { 
-                    currentScore = 0;
-                    sequence.clear();
-                    // 播放開始音效
-                    tone(PIN_BUZZER, 523, 150); delay(150);
-                    tone(PIN_BUZZER, 659, 150); delay(150);
-                    tone(PIN_BUZZER, 784, 300);
-                    
-                    update_status("Watch", "Carefully...", C_FLOWER_ON);
-                    vTaskDelay(1500);
-                    currentState = STATE_SHOWING;
+            case STATE_MENU_MAIN:
+                if (keyPressed) {
+                    if (key == '1') { currentState = STATE_MENU_GAME_SELECT; screen_msg("Select Game", "1.Memory 2.Count"); }
+                    else if (key == '2') { currentState = STATE_MENU_SETTINGS; redrawSettingsMenu(); }
+                    else if (key == '3') { currentState = STATE_MENU_DATA; drawDataHistoryScreen(); }
+                    else if (key == '4') { // 手動同步
+                        if (!firebaseReady) { initWiFi(); } 
+                        else { uploadPendingRecords(); }
+                        redrawMainMenu();
+                    }
+                }
+                break;
+            
+            case STATE_MENU_GAME_SELECT:
+                if (keyPressed) {
+                    if (key == '1') sysConfig.gameMode = 0;
+                    if (key == '2') sysConfig.gameMode = 1;
+                    if (key == '1' || key == '2') { currentState = STATE_MENU_DIFFICULTY; drawDifficultyMenu(); }
                 }
                 break;
 
-            case STATE_TEST:
-                // 任意鍵退出測試模式
-                if (key && keypad.getState() == PRESSED) {
-                    build_ui(); 
-                    currentState = STATE_IDLE;
-                }
-                break;
-
-            case STATE_SHOWING:
-                // 生成新題目
-                sequence.push_back(random(0, 9));
-                
-                // 播放序列
-                for (int step : sequence) {
-                    vTaskDelay(600); // 稍微慢一點，適合老年人
-                    drawFlower(step, true); // 花開
-                    tone(PIN_BUZZER, TONES[step], 400); // 播放對應音階
-                    vTaskDelay(500); 
-                    drawFlower(step, false); // 花謝
-                }
-                
-                update_status("Your Turn", "Repeat it!", C_STEM);
-                inputIndex = 0;
-                currentState = STATE_INPUT;
-                break;
-
-            case STATE_INPUT:
-                if (key && keypad.getState() == PRESSED) { 
-                    int userPress = key - '1'; // 將 char '1' 轉為 int 0
-                    
-                    if (userPress >= 0 && userPress <= 8) {
-                        // 按鍵反饋
-                        drawFlower(userPress, true);
-                        tone(PIN_BUZZER, TONES[userPress], 200);
-                        vTaskDelay(200);
-                        drawFlower(userPress, false);
-
-                        // 檢查答案
-                        if (userPress == sequence[inputIndex]) {
-                            inputIndex++;
-                            // 如果序列全部輸入正確
-                            if (inputIndex >= sequence.size()) {
-                                currentScore++;
-                                update_status("Good!", "Score: " + String(currentScore), C_FLOWER_ON);
-                                vTaskDelay(1000); // 稍作休息
-                                currentState = STATE_SHOWING; // 下一關
-                            }
-                        } else {
-                            // 輸入錯誤
-                            currentState = STATE_GAMEOVER;
-                        }
+            case STATE_MENU_DIFFICULTY:
+                if (keyPressed) {
+                    if (key == '1') sysConfig.difficulty = 0;
+                    if (key == '2') sysConfig.difficulty = 1;
+                    if (key == '3') sysConfig.difficulty = 2;
+                    if (key >= '1' && key <= '3') {
+                        currentScore = 0; gameStartTime = millis();
+                        currentState = STATE_GUIDE_READY; screen_msg("Ready?", "Press 5", COLOR_SUCCESS);
                     }
                 }
                 break;
 
-            case STATE_GAMEOVER:
-                // 失敗音效 (低沈溫和，不要太刺耳)
-                tone(PIN_BUZZER, 392, 300); vTaskDelay(300);
-                tone(PIN_BUZZER, 349, 300); vTaskDelay(300);
-                tone(PIN_BUZZER, 330, 800);
-                
-                update_status("Game Over", "Score: " + String(currentScore), C_SHADOW);
-                vTaskDelay(3000); // 給予足夠時間閱讀分數
-                
-                update_status("Ready?", "Press '5'\nTo Play", C_TEXT_DARK);
-                currentState = STATE_IDLE;
+            case STATE_MENU_SETTINGS:
+                if (keyPressed) {
+                    if (key == '1') { sysConfig.soundOn = !sysConfig.soundOn; redrawSettingsMenu(); }
+                    else if (key == '2') { clearHistory(); screen_msg("Data Cleared", "", COLOR_ERROR); vTaskDelay(1000); redrawSettingsMenu(); }
+                }
+                break;
+            
+            case STATE_MENU_DATA: break; // 等待 9 返回
+
+            case STATE_GUIDE_READY:
+                if (keyPressed && key == '5') { currentState = STATE_GUIDE_OBSERVE; screen_msg("Observe", "Press 5", COLOR_ACCENT); }
+                break;
+            case STATE_GUIDE_OBSERVE:
+                if (keyPressed && key == '5') {
+                    if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+                        tft->fillScreen(COLOR_BG_LIGHT); tft->drawFastVLine(startX - 10, 0, 320, COLOR_BG_SHADOW); xSemaphoreGive(xGuiMutex);
+                    }
+                    if (sysConfig.gameMode == 0) { 
+                        for(int i=0; i<9; i++) drawGameElement(i, false); currentState = STATE_MEM_SHOWING; 
+                    } else { currentState = STATE_CNT_PREPARE; }
+                    vTaskDelay(500);
+                }
+                break;
+
+            case STATE_MEM_SHOWING:
+                if (sequence.empty() || currentScore >= sequence.size()) sequence.push_back(random(0, 9));
+                update_status("Watch...");
+                for (int step : sequence) {
+                    vTaskDelay(1000); drawGameElement(step, true); playTone(TONES[step], 200);
+                    vTaskDelay(500); drawGameElement(step, false);
+                }
+                currentState = STATE_GUIDE_RECALL; screen_msg("Recall", "Press 5", COLOR_PRIMARY);
+                break;
+            
+            case STATE_GUIDE_RECALL:
+                if (keyPressed && key == '5') {
+                    if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+                        tft->fillScreen(COLOR_BG_LIGHT); tft->drawFastVLine(startX - 10, 0, 320, COLOR_BG_SHADOW); xSemaphoreGive(xGuiMutex);
+                    }
+                    if (sysConfig.gameMode == 0) {
+                        for(int i=0; i<9; i++) drawGameElement(i, false); currentState = STATE_MEM_INPUT; update_status("Input!", COLOR_SUCCESS); inputIndex = 0;
+                    } else { currentState = STATE_CNT_INPUT; update_status("Tap Any!", COLOR_SUCCESS); userTapCount = 0; lastTapTime = millis(); }
+                }
+                break;
+
+            case STATE_MEM_INPUT:
+                 if (keyPressed) {
+                    int userPress = key - '1';
+                    if (userPress >= 0 && userPress <= 8) {
+                        drawGameElement(userPress, true); playTone(TONES[userPress], 100);
+                        vTaskDelay(100); drawGameElement(userPress, false);
+                        if (userPress == sequence[inputIndex]) {
+                            inputIndex++;
+                            if (inputIndex >= sequence.size()) {
+                                currentScore++; update_status("Good!", COLOR_SUCCESS); vTaskDelay(1000);
+                                currentState = STATE_GUIDE_OBSERVE; screen_msg("Next", "Press 5", COLOR_SUCCESS);
+                            }
+                        } else {
+                            update_status("Wrong", COLOR_ERROR); playTone(100, 500); currentState = STATE_GAME_OVER; 
+                        }
+                    }
+                 }
+                 break;
+
+            case STATE_CNT_PREPARE:
+                 targetCount = random(1, 6); sequence.clear(); for(int i=0; i<9; i++) sequence.push_back(i);
+                 for(int i=0; i<9; i++) { int r = random(i, 9); int t=sequence[i]; sequence[i]=sequence[r]; sequence[r]=t; }
+                 if (xSemaphoreTake(xGuiMutex, portMAX_DELAY) == pdTRUE) {
+                     tft->fillScreen(COLOR_BG_LIGHT); tft->drawFastVLine(startX - 10, 0, 320, COLOR_BG_SHADOW); xSemaphoreGive(xGuiMutex);
+                 }
+                 for(int i=0; i<targetCount; i++) drawGameElement(sequence[i], true);
+                 update_status("Count"); showStartTime = millis(); currentState = STATE_CNT_WAITING;
+                 break;
+            case STATE_CNT_WAITING:
+                 if ((millis() - showStartTime > 5000) || (keyPressed && key == '8')) {
+                      currentState = STATE_GUIDE_RECALL; screen_msg("How Many?", "Press 5", COLOR_PRIMARY);
+                 }
+                 break;
+            case STATE_CNT_INPUT:
+                 if (keyPressed) {
+                     userTapCount++; lastTapTime = millis(); playTone(880, 50); update_status(String(userTapCount));
+                 }
+                 if (userTapCount > 0 && millis() - lastTapTime > 2000) {
+                     if (userTapCount == targetCount) {
+                         currentScore++; update_status("Correct!", COLOR_SUCCESS); vTaskDelay(1000);
+                         currentState = STATE_GUIDE_OBSERVE; screen_msg("Next", "Press 5", COLOR_SUCCESS);
+                     } else {
+                         update_status("Wrong", COLOR_ERROR); currentState = STATE_GAME_OVER;
+                     }
+                 }
+                 break;
+
+            case STATE_GAME_OVER:
+                if (keyPressed) {
+                    if (key == '5') {
+                        currentScore = 0; currentState = STATE_GUIDE_READY; screen_msg("Retry", "Press 5", COLOR_ACCENT);
+                    } else if (key == '9') {
+                        saveScoreToFirebase(currentScore, (millis()-gameStartTime)/1000);
+                        currentState = STATE_MENU_MAIN; redrawMainMenu();
+                    }
+                }
                 break;
         }
-        
-        vTaskDelay(10); // 讓出 CPU 資源，防止看門狗重置
+        vTaskDelay(10);
     }
 }
 
 // ==========================================
-// 6. 系統初始化
+// 11. 初始化與主循環
 // ==========================================
 void setup() {
     Serial.begin(115200);
     pinMode(PIN_BUZZER, OUTPUT);
 
-    // 初始化屏幕
-    if (!tft->begin()) {
-        Serial.println("TFT Init Fail");
-    }
-    tft->fillScreen(C_BG);
-    
-    // 初始化觸摸
-    if (!ts.begin()) {
-        Serial.println("Touch Init Failed");
-    }
-    ts.setRotation(1); // 確保觸摸方向與屏幕方向一致
+    tft->begin();
+    tft->setRotation(1); 
+    tft->fillScreen(COLOR_BG_LIGHT);
+    if (!ts.begin()) Serial.println("Touch Fail");
+    ts.setRotation(1); 
 
-    // 創建互斥鎖
     xGuiMutex = xSemaphoreCreateMutex();
-    
-    // 繪製初始界面
-    build_ui(); 
-
-    // 初始化隨機數種子 (利用懸空引腳的噪聲)
+    loadHistory(); 
     randomSeed(analogRead(34));
 
-    // 啟動遊戲任務 (運行在 Core 1)
-    // 堆棧大小 4096，優先級 1
-    xTaskCreatePinnedToCore(task_game, "Game", 4096, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(task_system, "Sys", 8192, NULL, 1, NULL, 1);
 }
 
 void loop() { 
-    // Arduino 的 loop 在 FreeRTOS 下通常留空或刪除任務
     vTaskDelete(NULL); 
 }
